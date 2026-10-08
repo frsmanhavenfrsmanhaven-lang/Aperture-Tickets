@@ -1,122 +1,167 @@
 require("dotenv").config();
 
+const express = require("express");
+const session = require("express-session");
+const fs = require("fs");
+const path = require("path");
+
 const {
     Client,
     GatewayIntentBits,
+    PermissionsBitField,
     ChannelType,
-    PermissionFlagsBits,
     EmbedBuilder,
     ActionRowBuilder,
     ButtonBuilder,
     ButtonStyle,
-    SlashCommandBuilder,
     REST,
-    Routes
+    Routes,
+    SlashCommandBuilder
 } = require("discord.js");
-
-const express = require("express");
-const session = require("express-session");
-const crypto = require("crypto");
-const fs = require("fs");
-const path = require("path");
 
 /* =========================================================
    CONFIG
 ========================================================= */
 
-const TOKEN = process.env.DISCORD_TOKEN;
-const CLIENT_ID = process.env.CLIENT_ID;
-const CLIENT_SECRET = process.env.CLIENT_SECRET;
+const app = express();
 
 const PORT = Number(process.env.PORT || 3000);
 
-const DASHBOARD_URL = (
-    process.env.DASHBOARD_URL || `http://localhost:${PORT}`
-).replace(/\/$/, "");
+const BOT_NAME = process.env.BOT_NAME || "Aperture Tickets";
+
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID;
+const CLIENT_SECRET = process.env.CLIENT_SECRET;
+
+const SESSION_SECRET =
+    process.env.SESSION_SECRET ||
+    "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET";
+
+const DASHBOARD_URL =
+    process.env.DASHBOARD_URL ||
+    `http://localhost:${PORT}`;
 
 const REDIRECT_URI =
     process.env.DISCORD_REDIRECT_URI ||
     `${DASHBOARD_URL}/auth/callback`;
 
-const BOT_NAME = process.env.BOT_NAME || "NexusTickets";
-
-const SESSION_SECRET =
-    process.env.SESSION_SECRET ||
-    crypto.randomBytes(32).toString("hex");
-
-if (!TOKEN) {
-    console.error("ERROR: DISCORD_TOKEN is missing from .env");
+if (!DISCORD_TOKEN) {
+    console.error("Missing DISCORD_TOKEN in .env / Render environment.");
     process.exit(1);
 }
 
 if (!CLIENT_ID) {
-    console.error("ERROR: CLIENT_ID is missing from .env");
+    console.error("Missing CLIENT_ID in .env / Render environment.");
     process.exit(1);
 }
 
 if (!CLIENT_SECRET) {
-    console.error("ERROR: CLIENT_SECRET is missing from .env");
+    console.error("Missing CLIENT_SECRET in .env / Render environment.");
     process.exit(1);
 }
 
 /* =========================================================
-   DATABASE
+   EXPRESS
 ========================================================= */
 
-const DATABASE_FILE = path.join(__dirname, "guilds.json");
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
-let database = {};
+/*
+   IMPORTANT FOR RENDER
 
-if (fs.existsSync(DATABASE_FILE)) {
+   Render sits behind a proxy. Trusting the proxy allows
+   Express to correctly understand HTTPS and set secure
+   session cookies.
+*/
+
+app.set("trust proxy", 1);
+
+app.use(
+    session({
+        secret: SESSION_SECRET,
+        resave: false,
+        saveUninitialized: false,
+        proxy: true,
+        cookie: {
+            secure: true,
+            httpOnly: true,
+            sameSite: "lax",
+            maxAge: 1000 * 60 * 60 * 24
+        }
+    })
+);
+
+/* =========================================================
+   DATA
+========================================================= */
+
+const DATA_FILE = path.join(__dirname, "guilds.json");
+
+function loadGuildData() {
     try {
-        database = JSON.parse(
-            fs.readFileSync(DATABASE_FILE, "utf8")
+        if (!fs.existsSync(DATA_FILE)) {
+            fs.writeFileSync(DATA_FILE, "{}");
+            return {};
+        }
+
+        return JSON.parse(
+            fs.readFileSync(DATA_FILE, "utf8")
         );
-    } catch {
-        database = {};
+    } catch (error) {
+        console.error("Could not load guild data:", error);
+        return {};
     }
 }
 
-function saveDatabase() {
-    fs.writeFileSync(
-        DATABASE_FILE,
-        JSON.stringify(database, null, 2)
-    );
+let guildData = loadGuildData();
+
+function saveGuildData() {
+    try {
+        fs.writeFileSync(
+            DATA_FILE,
+            JSON.stringify(guildData, null, 2)
+        );
+    } catch (error) {
+        console.error("Could not save guild data:", error);
+    }
+}
+
+function defaultGuildConfig() {
+    return {
+        panel: {
+            title: "Contact Support",
+            description:
+                "Click the button below to create a private support ticket.",
+            color: "#5865F2",
+            footer: "Aperture Tickets",
+            buttonLabel: "Create Ticket",
+            buttonStyle: "primary",
+            thumbnail: "",
+            image: ""
+        },
+
+        ticket: {
+            categoryId: "",
+            supportRoleId: "",
+            closeRoleId: "",
+            allowUserClose: true,
+            prefix: "ticket"
+        },
+
+        dashboard: {
+            panelChannelId: ""
+        }
+    };
 }
 
 function getGuildConfig(guildId) {
-    if (!database[guildId]) {
-        database[guildId] = {
-            panel: {
-                title: "Need help?",
-                description:
-                    "Click the button below to create a private support ticket.",
-                color: "#5865F2",
-                footer: "NexusTickets",
-                buttonLabel: "Create Ticket",
-                buttonStyle: "Primary",
-                thumbnail: "",
-                image: ""
-            },
-
-            ticket: {
-                categoryId: "",
-                supportRoleId: "",
-                closeRoleId: "",
-                prefix: "ticket",
-                allowUserClose: true
-            },
-
-            lastPanel: {
-                channelId: "",
-                messageId: ""
-            }
-        };
-
-        saveDatabase();
+    if (!guildData[guildId]) {
+        guildData[guildId] = defaultGuildConfig();
+        saveGuildData();
     }
 
-    return database[guildId];
+    return guildData[guildId];
 }
 
 /* =========================================================
@@ -131,101 +176,86 @@ const client = new Client({
 });
 
 /* =========================================================
-   EXPRESS
+   SLASH COMMANDS
 ========================================================= */
 
-const app = express();
+const slashCommands = [
+    new SlashCommandBuilder()
+        .setName("ticket")
+        .setDescription("Aperture Tickets commands.")
+        .addSubcommand(sub =>
+            sub
+                .setName("status")
+                .setDescription("View the ticket configuration.")
+        )
+        .addSubcommand(sub =>
+            sub
+                .setName("config")
+                .setDescription("Open the Aperture Tickets dashboard.")
+        )
+        .addSubcommand(sub =>
+            sub
+                .setName("close")
+                .setDescription("Close the current ticket.")
+        )
+].map(command => command.toJSON());
 
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+async function registerCommands() {
+    try {
+        const rest = new REST({ version: "10" })
+            .setToken(DISCORD_TOKEN);
 
-app.use(
-    session({
-        secret: SESSION_SECRET,
-        resave: false,
-        saveUninitialized: false,
-        cookie: {
-            httpOnly: true,
-            sameSite: "lax",
-            secure: DASHBOARD_URL.startsWith("https://"),
-            maxAge: 7 * 24 * 60 * 60 * 1000
-        }
-    })
-);
+        console.log("Registering Aperture Tickets slash commands...");
+
+        await rest.put(
+            Routes.applicationCommands(CLIENT_ID),
+            {
+                body: slashCommands
+            }
+        );
+
+        console.log("Slash commands registered.");
+        console.log("  /ticket status");
+        console.log("  /ticket config");
+        console.log("  /ticket close");
+    } catch (error) {
+        console.error(
+            "Slash command registration error:",
+            error
+        );
+    }
+}
 
 /* =========================================================
    HELPERS
 ========================================================= */
 
-function escapeHTML(value = "") {
+function escapeHtml(value = "") {
     return String(value)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#039;");
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
 }
 
-function colorToInt(color) {
-    const clean = String(color || "")
-        .replace("#", "")
-        .trim();
-
-    if (!/^[0-9a-fA-F]{6}$/.test(clean)) {
-        return 0x5865f2;
-    }
-
-    return parseInt(clean, 16);
-}
-
-function isManager(guild) {
-    if (!guild) return false;
-
-    if (guild.owner === true) return true;
-
-    const permissions = BigInt(guild.permissions || "0");
+function isManager(member) {
+    if (!member) return false;
 
     return (
-        (permissions &
-            BigInt(PermissionFlagsBits.Administrator)) !==
-            0n ||
-        (permissions &
-            BigInt(PermissionFlagsBits.ManageGuild)) !==
-            0n
+        member.permissions &&
+        (
+            member.permissions.includes("Administrator") ||
+            member.permissions.includes("ManageGuild")
+        )
     );
 }
 
-function requireLogin(req, res, next) {
-    if (!req.session.user) {
-        return res.redirect("/login");
-    }
-
-    next();
-}
-
-function getInviteURL(guildId = "") {
-    const permissions =
-        process.env.BOT_PERMISSIONS ||
-        "2147609616";
-
+function makeDiscordAuthURL(state) {
     const params = new URLSearchParams({
         client_id: CLIENT_ID,
-        permissions,
-        scope: "bot applications.commands"
-    });
-
-    if (guildId) {
-        params.set("guild_id", guildId);
-    }
-
-    return `https://discord.com/oauth2/authorize?${params.toString()}`;
-}
-
-function getOAuthURL(state) {
-    const params = new URLSearchParams({
-        client_id: CLIENT_ID,
-        redirect_uri: REDIRECT_URI,
         response_type: "code",
+        redirect_uri: REDIRECT_URI,
         scope: "identify guilds",
         state
     });
@@ -233,656 +263,134 @@ function getOAuthURL(state) {
     return `https://discord.com/oauth2/authorize?${params.toString()}`;
 }
 
-async function discordAPI(endpoint, options = {}) {
-    const response = await fetch(
-        `https://discord.com/api/v10${endpoint}`,
-        options
-    );
+async function discordFetch(url, options = {}) {
+    const response = await fetch(url, options);
 
-    const text = await response.text();
-
-    let data;
+    let data = null;
 
     try {
-        data = JSON.parse(text);
+        data = await response.json();
     } catch {
-        data = text;
+        data = null;
     }
 
-    if (!response.ok) {
-        throw new Error(
-            `Discord API ${response.status}: ${
-                typeof data === "string"
-                    ? data
-                    : JSON.stringify(data)
-            }`
-        );
-    }
-
-    return data;
+    return {
+        response,
+        data
+    };
 }
 
 /* =========================================================
-   HTML LAYOUT
-========================================================= */
-
-function layout(title, body, user = null) {
-    return `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-
-<title>${escapeHTML(title)} - ${escapeHTML(BOT_NAME)}</title>
-
-<style>
-
-* {
-    box-sizing: border-box;
-}
-
-body {
-    margin: 0;
-    background: #080808;
-    color: #f5f5f5;
-    font-family:
-        Inter,
-        ui-sans-serif,
-        system-ui,
-        -apple-system,
-        BlinkMacSystemFont,
-        "Segoe UI",
-        sans-serif;
-}
-
-a {
-    text-decoration: none;
-    color: inherit;
-}
-
-.nav {
-    height: 70px;
-    border-bottom: 1px solid #202020;
-    background: #0b0b0b;
-
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-
-    padding: 0 32px;
-}
-
-.logo {
-    font-size: 21px;
-    font-weight: 800;
-}
-
-.logo span {
-    color: #666;
-}
-
-.nav-right {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-}
-
-.user {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    color: #bbb;
-}
-
-.avatar {
-    width: 34px;
-    height: 34px;
-    border-radius: 50%;
-    background: #202020;
-    object-fit: cover;
-}
-
-.container {
-    width: min(1180px, calc(100% - 40px));
-    margin: auto;
-}
-
-.hero {
-    text-align: center;
-    padding: 110px 0;
-}
-
-.hero h1 {
-    margin: 0 0 18px;
-    font-size: 60px;
-    letter-spacing: -3px;
-}
-
-.hero p {
-    max-width: 680px;
-    margin: auto;
-    color: #888;
-    font-size: 18px;
-    line-height: 1.7;
-}
-
-.buttons {
-    display: flex;
-    justify-content: center;
-    gap: 10px;
-    margin-top: 30px;
-    flex-wrap: wrap;
-}
-
-.btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-
-    border: 0;
-    border-radius: 8px;
-
-    padding: 11px 17px;
-
-    background: #f5f5f5;
-    color: #080808;
-
-    font-size: 14px;
-    font-weight: 700;
-
-    cursor: pointer;
-}
-
-.btn:hover {
-    opacity: .85;
-}
-
-.btn.secondary {
-    background: #171717;
-    color: #eee;
-    border: 1px solid #292929;
-}
-
-.page {
-    padding: 38px 0 70px;
-}
-
-.page-title {
-    margin-bottom: 25px;
-}
-
-.page-title h1 {
-    margin: 0 0 7px;
-    font-size: 31px;
-}
-
-.page-title p {
-    margin: 0;
-    color: #777;
-}
-
-.grid {
-    display: grid;
-    grid-template-columns:
-        repeat(auto-fill, minmax(290px, 1fr));
-
-    gap: 16px;
-}
-
-.card {
-    background: #101010;
-    border: 1px solid #222;
-    border-radius: 12px;
-    padding: 20px;
-}
-
-.server {
-    display: flex;
-    align-items: center;
-    gap: 13px;
-}
-
-.server-icon {
-    width: 55px;
-    height: 55px;
-    border-radius: 14px;
-    background: #1d1d1d;
-    object-fit: cover;
-}
-
-.server-name {
-    font-size: 16px;
-    font-weight: 700;
-}
-
-.server-id {
-    color: #666;
-    font-size: 11px;
-    margin-top: 4px;
-}
-
-.card-actions {
-    margin-top: 18px;
-    display: flex;
-    gap: 8px;
-}
-
-.section {
-    background: #101010;
-    border: 1px solid #222;
-    border-radius: 12px;
-    padding: 24px;
-    margin-bottom: 18px;
-}
-
-.section h2 {
-    margin: 0 0 6px;
-    font-size: 18px;
-}
-
-.section-desc {
-    color: #777;
-    font-size: 13px;
-    margin-bottom: 20px;
-}
-
-.notice {
-    background: #111;
-    border: 1px solid #282828;
-    border-radius: 8px;
-    padding: 14px;
-    color: #999;
-    margin-bottom: 18px;
-}
-
-.form-grid {
-    display: grid;
-    grid-template-columns:
-        repeat(2, minmax(0, 1fr));
-
-    gap: 16px;
-}
-
-.field {
-    display: flex;
-    flex-direction: column;
-    gap: 7px;
-}
-
-.field.full {
-    grid-column: 1 / -1;
-}
-
-label {
-    color: #bbb;
-    font-size: 13px;
-    font-weight: 600;
-}
-
-input,
-textarea,
-select {
-    width: 100%;
-
-    background: #080808;
-    border: 1px solid #292929;
-
-    color: #eee;
-
-    border-radius: 8px;
-    padding: 11px 12px;
-
-    outline: none;
-    font-family: inherit;
-}
-
-input:focus,
-textarea:focus,
-select:focus {
-    border-color: #555;
-}
-
-textarea {
-    min-height: 130px;
-    resize: vertical;
-}
-
-.checkbox {
-    display: flex;
-    flex-direction: row;
-    align-items: center;
-    gap: 9px;
-}
-
-.checkbox input {
-    width: auto;
-}
-
-.actions {
-    display: flex;
-    gap: 9px;
-    flex-wrap: wrap;
-    margin-top: 20px;
-}
-
-.preview {
-    background: #080808;
-    border: 1px solid #292929;
-    border-radius: 10px;
-    padding: 20px;
-}
-
-.preview-embed {
-    border-left: 4px solid #5865f2;
-    background: #151515;
-    border-radius: 5px;
-    padding: 18px;
-}
-
-.preview-title {
-    font-weight: 800;
-    margin-bottom: 9px;
-}
-
-.preview-description {
-    color: #aaa;
-    white-space: pre-wrap;
-    line-height: 1.5;
-}
-
-.footer {
-    border-top: 1px solid #202020;
-    padding: 30px;
-    text-align: center;
-    color: #555;
-    font-size: 13px;
-}
-
-@media(max-width: 700px) {
-
-    .form-grid {
-        grid-template-columns: 1fr;
-    }
-
-    .field.full {
-        grid-column: auto;
-    }
-
-    .hero h1 {
-        font-size: 42px;
-    }
-
-    .nav {
-        padding: 0 16px;
-    }
-
-}
-
-</style>
-</head>
-
-<body>
-
-<nav class="nav">
-
-    <a href="/" class="logo">
-        ${escapeHTML(BOT_NAME)}<span>.</span>
-    </a>
-
-    <div class="nav-right">
-
-        ${
-            user
-                ? `
-                <div class="user">
-
-                    ${
-                        user.avatar
-                            ? `
-                            <img
-                                class="avatar"
-                                src="${escapeHTML(user.avatar)}"
-                            >
-                            `
-                            : `
-                            <div class="avatar"></div>
-                            `
-                    }
-
-                    <span>
-                        ${escapeHTML(
-                            user.global_name ||
-                                user.username
-                        )}
-                    </span>
-
-                </div>
-
-                <a class="btn secondary" href="/logout">
-                    Logout
-                </a>
-                `
-                : `
-                <a class="btn secondary" href="/login">
-                    Login with Discord
-                </a>
-                `
-        }
-
-    </div>
-
-</nav>
-
-${body}
-
-<div class="footer">
-    ${escapeHTML(BOT_NAME)} · Discord Ticket Management
-</div>
-
-</body>
-</html>
-`;
-}
-
-/* =========================================================
-   HOME
-========================================================= */
-
-app.get("/", (req, res) => {
-    res.send(
-        layout(
-            "Home",
-            `
-            <div class="container">
-
-                <div class="hero">
-
-                    <h1>
-                        ${escapeHTML(BOT_NAME)}
-                    </h1>
-
-                    <p>
-                        A modern Discord ticket system with a powerful
-                        dashboard for configuring and sending your ticket
-                        panels.
-                    </p>
-
-                    <div class="buttons">
-
-                        ${
-                            req.session.user
-                                ? `
-                                <a
-                                    class="btn"
-                                    href="/dashboard"
-                                >
-                                    Open Dashboard
-                                </a>
-                                `
-                                : `
-                                <a
-                                    class="btn"
-                                    href="/login"
-                                >
-                                    Login with Discord
-                                </a>
-                                `
-                        }
-
-                        <a
-                            class="btn secondary"
-                            href="${getInviteURL()}"
-                        >
-                            Invite Bot
-                        </a>
-
-                    </div>
-
-                </div>
-
-            </div>
-            `,
-            req.session.user
-        )
-    );
-});
-
-/* =========================================================
-   LOGIN
+   AUTH
 ========================================================= */
 
 app.get("/login", (req, res) => {
-    const state = crypto.randomBytes(32).toString("hex");
+    const state =
+        require("crypto")
+            .randomBytes(32)
+            .toString("hex");
 
     req.session.oauthState = state;
 
-    res.redirect(
-        getOAuthURL(state)
-    );
-});
-
-/* =========================================================
-   OAUTH CALLBACK
-========================================================= */
-
-app.get("/auth/callback", async (req, res) => {
-
-    try {
-
-        const {
-            code,
-            state,
-            error
-        } = req.query;
-
+    req.session.save(error => {
         if (error) {
-            return res.status(400).send(
-                layout(
-                    "Discord Login Error",
-                    `
-                    <div class="container page">
-
-                        <div class="section">
-
-                            <h2>Discord login failed</h2>
-
-                            <p class="section-desc">
-                                ${escapeHTML(error)}
-                            </p>
-
-                            <a
-                                class="btn"
-                                href="/login"
-                            >
-                                Try Again
-                            </a>
-
-                        </div>
-
-                    </div>
-                    `
-                )
+            console.error(
+                "Could not save OAuth session:",
+                error
             );
+
+            return res
+                .status(500)
+                .send("Could not start Discord login.");
         }
 
-        if (!code) {
-            return res.status(400).send(
-                layout(
-                    "Discord Login Error",
-                    `
-                    <div class="container page">
+        res.redirect(makeDiscordAuthURL(state));
+    });
+});
 
-                        <div class="section">
+app.get("/auth/callback", async (req, res) => {
+    try {
+        const { code, state } = req.query;
 
-                            <h2>No authorization code</h2>
-
-                            <p class="section-desc">
-                                Discord did not return an authorization code.
-                            </p>
-
-                            <a
-                                class="btn"
-                                href="/login"
-                            >
-                                Try Again
-                            </a>
-
-                        </div>
-
-                    </div>
-                    `
-                )
-            );
+        if (!code || !state) {
+            return res.status(400).send(`
+                <h1>Discord Login Failed</h1>
+                <p>Missing OAuth information.</p>
+                <a href="/login">Login Again</a>
+            `);
         }
 
         if (
-            !state ||
-            state !== req.session.oauthState
+            !req.session.oauthState ||
+            req.session.oauthState !== state
         ) {
+            return res.status(400).send(`
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>Invalid login session</title>
+                    <style>
+                        body {
+                            margin: 0;
+                            background: #090909;
+                            color: white;
+                            font-family: Arial, sans-serif;
+                            display: flex;
+                            align-items: center;
+                            justify-content: center;
+                            min-height: 100vh;
+                        }
 
-            return res.status(400).send(
-                layout(
-                    "Discord Login Error",
-                    `
-                    <div class="container page">
+                        .box {
+                            width: 420px;
+                            max-width: calc(100% - 40px);
+                            background: #111;
+                            border: 1px solid #292929;
+                            border-radius: 18px;
+                            padding: 35px;
+                            text-align: center;
+                        }
 
-                        <div class="section">
+                        h1 {
+                            margin-top: 0;
+                        }
 
-                            <h2>Invalid login session</h2>
-
-                            <p class="section-desc">
-                                The Discord OAuth session did not match.
-                                Start the login again.
-                            </p>
-
-                            <a
-                                class="btn"
-                                href="/login"
-                            >
-                                Login Again
-                            </a>
-
-                        </div>
-
+                        a {
+                            display: inline-block;
+                            margin-top: 20px;
+                            padding: 12px 20px;
+                            border-radius: 10px;
+                            background: #5865f2;
+                            color: white;
+                            text-decoration: none;
+                            font-weight: bold;
+                        }
+                    </style>
+                </head>
+                <body>
+                    <div class="box">
+                        <h1>Invalid login session</h1>
+                        <p>
+                            The Discord OAuth session did not match.
+                            Start the login again.
+                        </p>
+                        <a href="/login">Login Again</a>
                     </div>
-                    `
-                )
-            );
+                </body>
+                </html>
+            `);
         }
 
         delete req.session.oauthState;
 
-        const tokenResponse = await fetch(
-            "https://discord.com/api/v10/oauth2/token",
+        const tokenResult = await discordFetch(
+            "https://discord.com/api/oauth2/token",
             {
                 method: "POST",
-
                 headers: {
                     "Content-Type":
                         "application/x-www-form-urlencoded"
                 },
-
                 body: new URLSearchParams({
                     client_id: CLIENT_ID,
                     client_secret: CLIENT_SECRET,
@@ -893,2230 +401,1460 @@ app.get("/auth/callback", async (req, res) => {
             }
         );
 
-        const tokenText =
-            await tokenResponse.text();
-
-        let tokenData;
-
-        try {
-            tokenData =
-                JSON.parse(tokenText);
-        } catch {
-            tokenData = {};
-        }
-
         if (
-            !tokenResponse.ok ||
-            !tokenData.access_token
+            !tokenResult.response.ok ||
+            !tokenResult.data
         ) {
-
             console.error(
-                "OAuth token error:",
-                tokenText
+                "Discord token exchange failed:",
+                tokenResult.data
             );
 
-            return res.status(500).send(
-                layout(
-                    "Discord Login Error",
-                    `
-                    <div class="container page">
-
-                        <div class="section">
-
-                            <h2>Discord OAuth failed</h2>
-
-                            <p class="section-desc">
-                                Discord rejected the OAuth login.
-                                Check your Client ID, Client Secret
-                                and Redirect URI.
-                            </p>
-
-                            <a
-                                class="btn"
-                                href="/login"
-                            >
-                                Try Again
-                            </a>
-
-                        </div>
-
-                    </div>
-                    `
-                )
-            );
+            return res.status(500).send(`
+                <h1>Discord Login Failed</h1>
+                <p>Discord rejected the login request.</p>
+                <a href="/login">Try Again</a>
+            `);
         }
 
         const accessToken =
-            tokenData.access_token;
+            tokenResult.data.access_token;
 
-        const user =
-            await discordAPI(
-                "/users/@me",
-                {
-                    headers: {
-                        Authorization:
-                            `Bearer ${accessToken}`
-                    }
+        const userResult = await discordFetch(
+            "https://discord.com/api/users/@me",
+            {
+                headers: {
+                    Authorization:
+                        `Bearer ${accessToken}`
                 }
-            );
+            }
+        );
 
-        const guilds =
-            await discordAPI(
-                "/users/@me/guilds",
-                {
-                    headers: {
-                        Authorization:
-                            `Bearer ${accessToken}`
-                    }
+        if (!userResult.response.ok) {
+            return res.status(500).send(`
+                <h1>Discord Login Failed</h1>
+                <p>Could not retrieve your Discord account.</p>
+                <a href="/login">Try Again</a>
+            `);
+        }
+
+        const guildResult = await discordFetch(
+            "https://discord.com/api/users/@me/guilds",
+            {
+                headers: {
+                    Authorization:
+                        `Bearer ${accessToken}`
                 }
-            );
+            }
+        );
 
-        req.session.user = {
-            id: user.id,
-            username: user.username,
-            global_name: user.global_name,
+        const userGuilds =
+            guildResult.response.ok &&
+            Array.isArray(guildResult.data)
+                ? guildResult.data
+                : [];
 
-            avatar: user.avatar
-                ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png?size=128`
-                : null
-        };
+        req.session.user = userResult.data;
+        req.session.guilds = userGuilds;
 
-        req.session.guilds = guilds;
+        req.session.save(error => {
+            if (error) {
+                console.error(
+                    "Could not save authenticated session:",
+                    error
+                );
 
-        res.redirect("/dashboard");
+                return res.status(500).send(
+                    "Could not save login session."
+                );
+            }
+
+            res.redirect("/dashboard");
+        });
 
     } catch (error) {
-
         console.error(
             "OAuth callback error:",
             error
         );
 
-        res.status(500).send(
-            layout(
-                "Login Error",
-                `
-                <div class="container page">
-
-                    <div class="section">
-
-                        <h2>Login error</h2>
-
-                        <p class="section-desc">
-                            ${escapeHTML(error.message)}
-                        </p>
-
-                        <a
-                            class="btn"
-                            href="/login"
-                        >
-                            Try Again
-                        </a>
-
-                    </div>
-
-                </div>
-                `
-            )
-        );
+        res.status(500).send(`
+            <h1>Discord Login Failed</h1>
+            <p>An unexpected error occurred.</p>
+            <a href="/login">Try Again</a>
+        `);
     }
-
 });
 
-/* =========================================================
-   LOGOUT
-========================================================= */
-
 app.get("/logout", (req, res) => {
-
     req.session.destroy(() => {
         res.redirect("/");
     });
-
 });
 
 /* =========================================================
-   SERVER SELECTION
+   HOME
 ========================================================= */
 
-app.get(
-    "/dashboard",
-    requireLogin,
-    async (req, res) => {
+app.get("/", (req, res) => {
+    const loggedIn = !!req.session.user;
 
-        const guilds =
-            req.session.guilds || [];
+    res.send(`
+<!DOCTYPE html>
+<html>
+<head>
+    <title>${escapeHtml(BOT_NAME)}</title>
 
-        const manageable =
-            guilds.filter(isManager);
+    <meta name="viewport"
+          content="width=device-width, initial-scale=1">
 
-        res.send(
-            layout(
-                "Dashboard",
-                `
-                <div class="container page">
+    <style>
+        * {
+            box-sizing: border-box;
+        }
 
-                    <div class="page-title">
+        body {
+            margin: 0;
+            background: #070707;
+            color: #fff;
+            font-family:
+                Inter,
+                Arial,
+                Helvetica,
+                sans-serif;
+        }
 
-                        <h1>
-                            Your Servers
-                        </h1>
+        .nav {
+            height: 72px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 6%;
+            border-bottom: 1px solid #1b1b1b;
+            background: #090909;
+        }
 
-                        <p>
-                            Select a server to manage
-                            ${escapeHTML(BOT_NAME)}.
-                        </p>
+        .brand {
+            font-size: 21px;
+            font-weight: 800;
+        }
 
-                    </div>
+        .button {
+            display: inline-block;
+            text-decoration: none;
+            color: white;
+            background: #5865f2;
+            padding: 13px 20px;
+            border-radius: 10px;
+            font-weight: 700;
+            border: 0;
+            cursor: pointer;
+        }
 
-                    <div class="grid">
+        .button:hover {
+            background: #4752c4;
+        }
 
-                        ${
-                            manageable.length
-                                ? manageable
-                                      .map(
-                                          (guild) => {
+        .hero {
+            min-height: calc(100vh - 72px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            padding: 50px 20px;
+        }
 
-                                              const installed =
-                                                  client.guilds.cache.has(
-                                                      guild.id
-                                                  );
+        .hero-content {
+            max-width: 800px;
+        }
 
-                                              const icon =
-                                                  guild.icon
-                                                      ? `https://cdn.discordapp.com/icons/${guild.id}/${guild.icon}.png?size=128`
-                                                      : "";
+        .hero h1 {
+            font-size: clamp(42px, 8vw, 80px);
+            margin: 0;
+            letter-spacing: -3px;
+        }
 
-                                              return `
-                                              <div class="card">
+        .hero p {
+            color: #a6a6a6;
+            font-size: 19px;
+            line-height: 1.6;
+            margin: 25px auto 35px;
+            max-width: 650px;
+        }
 
-                                                  <div class="server">
+        .badge {
+            display: inline-block;
+            color: #aab0ff;
+            border: 1px solid #30346d;
+            background: #10122a;
+            border-radius: 100px;
+            padding: 8px 14px;
+            margin-bottom: 20px;
+            font-size: 13px;
+            font-weight: 700;
+        }
+    </style>
+</head>
 
-                                                      ${
-                                                          icon
-                                                              ? `
-                                                              <img
-                                                                  class="server-icon"
-                                                                  src="${icon}"
-                                                              >
-                                                              `
-                                                              : `
-                                                              <div class="server-icon"></div>
-                                                              `
-                                                      }
+<body>
 
-                                                      <div>
+<nav class="nav">
+    <div class="brand">${escapeHtml(BOT_NAME)}</div>
 
-                                                          <div class="server-name">
-                                                              ${escapeHTML(
-                                                                  guild.name
-                                                              )}
-                                                          </div>
-
-                                                          <div class="server-id">
-                                                              ${escapeHTML(
-                                                                  guild.id
-                                                              )}
-                                                          </div>
-
-                                                      </div>
-
-                                                  </div>
-
-                                                  <div class="card-actions">
-
-                                                      ${
-                                                          installed
-                                                              ? `
-                                                              <a
-                                                                  class="btn"
-                                                                  href="/dashboard/${guild.id}"
-                                                              >
-                                                                  Manage
-                                                              </a>
-                                                              `
-                                                              : `
-                                                              <a
-                                                                  class="btn"
-                                                                  href="${getInviteURL(guild.id)}"
-                                                              >
-                                                                  Invite Bot
-                                                              </a>
-                                                              `
-                                                      }
-
-                                                  </div>
-
-                                              </div>
-                                              `;
-                                          }
-                                      )
-                                      .join("")
-                                : `
-                                <div class="card">
-
-                                    <h3>
-                                        No manageable servers
-                                    </h3>
-
-                                    <p style="color:#777">
-                                        You need Administrator or
-                                        Manage Server permission.
-                                    </p>
-
-                                </div>
-                                `
-                        }
-
-                    </div>
-
-                </div>
-                `,
-                req.session.user
-            )
-        );
+    ${
+        loggedIn
+            ? `<a class="button" href="/dashboard">Dashboard</a>`
+            : `<a class="button" href="/login">Login with Discord</a>`
     }
-);
+</nav>
+
+<section class="hero">
+    <div class="hero-content">
+
+        <div class="badge">
+            Discord Ticket Management
+        </div>
+
+        <h1>${escapeHtml(BOT_NAME)}</h1>
+
+        <p>
+            A modern ticket management system for Discord
+            servers. Configure your ticket system from one
+            simple dashboard.
+        </p>
+
+        ${
+            loggedIn
+                ? `
+                    <a class="button" href="/dashboard">
+                        Open Dashboard
+                    </a>
+                `
+                : `
+                    <a class="button" href="/login">
+                        Login with Discord
+                    </a>
+                `
+        }
+
+    </div>
+</section>
+
+</body>
+</html>
+    `);
+});
 
 /* =========================================================
-   SERVER DASHBOARD
+   DASHBOARD
 ========================================================= */
 
-app.get(
-    "/dashboard/:guildId",
-    requireLogin,
-    async (req, res) => {
-
-        const guildId =
-            req.params.guildId;
-
-        const userGuild =
-            (req.session.guilds || [])
-                .find(
-                    guild => guild.id === guildId
-                );
-
-        if (
-            !userGuild ||
-            !isManager(userGuild)
-        ) {
-
-            return res.status(403).send(
-                layout(
-                    "Access Denied",
-                    `
-                    <div class="container page">
-
-                        <div class="section">
-
-                            <h2>
-                                Access denied
-                            </h2>
-
-                            <p class="section-desc">
-                                You don't have permission
-                                to manage this server.
-                            </p>
-
-                        </div>
-
-                    </div>
-                    `,
-                    req.session.user
-                )
-            );
-        }
-
-        const guild =
-            client.guilds.cache.get(
-                guildId
-            );
-
-        if (!guild) {
-
-            return res.send(
-                layout(
-                    "Bot Not Installed",
-                    `
-                    <div class="container page">
-
-                        <div class="section">
-
-                            <h2>
-                                Bot not installed
-                            </h2>
-
-                            <p class="section-desc">
-                                Invite ${escapeHTML(BOT_NAME)}
-                                to this server first.
-                            </p>
-
-                            <a
-                                class="btn"
-                                href="${getInviteURL(guildId)}"
-                            >
-                                Invite Bot
-                            </a>
-
-                        </div>
-
-                    </div>
-                    `,
-                    req.session.user
-                )
-            );
-        }
-
-        const config =
-            getGuildConfig(guildId);
-
-        const channels =
-            guild.channels.cache
-                .filter(
-                    channel =>
-                        channel.type ===
-                            ChannelType.GuildText ||
-                        channel.type ===
-                            ChannelType.GuildAnnouncement
-                )
-                .sort(
-                    (a, b) =>
-                        a.position - b.position
-                );
-
-        const categories =
-            guild.channels.cache
-                .filter(
-                    channel =>
-                        channel.type ===
-                        ChannelType.GuildCategory
-                )
-                .sort(
-                    (a, b) =>
-                        a.position - b.position
-                );
-
-        const roles =
-            guild.roles.cache
-                .filter(
-                    role =>
-                        role.id !== guild.id
-                )
-                .sort(
-                    (a, b) =>
-                        b.position - a.position
-                );
-
-        res.send(
-            layout(
-                `${guild.name} Dashboard`,
-                `
-                <div class="container page">
-
-                    <div class="page-title">
-
-                        <h1>
-                            ${escapeHTML(guild.name)}
-                        </h1>
-
-                        <p>
-                            Ticket panel configuration
-                        </p>
-
-                    </div>
-
-                    <div class="notice">
-
-                        Customize your panel and ticket
-                        permissions below. When you click
-                        <strong>Save & Send Panel</strong>,
-                        the bot will immediately send the
-                        panel to your selected Discord channel.
-
-                    </div>
-
-                    <form
-                        method="POST"
-                        action="/dashboard/${guildId}/save"
-                    >
-
-                        <!-- PANEL -->
-
-                        <div class="section">
-
-                            <h2>
-                                Ticket Panel
-                            </h2>
-
-                            <div class="section-desc">
-                                Customize the panel users will see.
-                            </div>
-
-                            <div class="form-grid">
-
-                                <div class="field">
-
-                                    <label>
-                                        Panel Title
-                                    </label>
-
-                                    <input
-                                        name="title"
-                                        maxlength="256"
-                                        value="${escapeHTML(
-                                            config.panel.title
-                                        )}"
-                                        required
-                                    >
-
-                                </div>
-
-                                <div class="field">
-
-                                    <label>
-                                        Embed Color
-                                    </label>
-
-                                    <input
-                                        name="color"
-                                        value="${escapeHTML(
-                                            config.panel.color
-                                        )}"
-                                        placeholder="#5865F2"
-                                    >
-
-                                </div>
-
-                                <div class="field full">
-
-                                    <label>
-                                        Panel Description
-                                    </label>
-
-                                    <textarea
-                                        name="description"
-                                    >${escapeHTML(
-                                        config.panel.description
-                                    )}</textarea>
-
-                                </div>
-
-                                <div class="field">
-
-                                    <label>
-                                        Button Label
-                                    </label>
-
-                                    <input
-                                        name="buttonLabel"
-                                        maxlength="80"
-                                        value="${escapeHTML(
-                                            config.panel.buttonLabel
-                                        )}"
-                                    >
-
-                                </div>
-
-                                <div class="field">
-
-                                    <label>
-                                        Button Style
-                                    </label>
-
-                                    <select
-                                        name="buttonStyle"
-                                    >
-
-                                        <option
-                                            value="Primary"
-                                            ${
-                                                config.panel.buttonStyle ===
-                                                "Primary"
-                                                    ? "selected"
-                                                    : ""
-                                            }
-                                        >
-                                            Blurple
-                                        </option>
-
-                                        <option
-                                            value="Secondary"
-                                            ${
-                                                config.panel.buttonStyle ===
-                                                "Secondary"
-                                                    ? "selected"
-                                                    : ""
-                                            }
-                                        >
-                                            Gray
-                                        </option>
-
-                                        <option
-                                            value="Success"
-                                            ${
-                                                config.panel.buttonStyle ===
-                                                "Success"
-                                                    ? "selected"
-                                                    : ""
-                                            }
-                                        >
-                                            Green
-                                        </option>
-
-                                        <option
-                                            value="Danger"
-                                            ${
-                                                config.panel.buttonStyle ===
-                                                "Danger"
-                                                    ? "selected"
-                                                    : ""
-                                            }
-                                        >
-                                            Red
-                                        </option>
-
-                                    </select>
-
-                                </div>
-
-                                <div class="field">
-
-                                    <label>
-                                        Footer
-                                    </label>
-
-                                    <input
-                                        name="footer"
-                                        maxlength="2048"
-                                        value="${escapeHTML(
-                                            config.panel.footer
-                                        )}"
-                                    >
-
-                                </div>
-
-                                <div class="field">
-
-                                    <label>
-                                        Thumbnail URL
-                                    </label>
-
-                                    <input
-                                        name="thumbnail"
-                                        value="${escapeHTML(
-                                            config.panel.thumbnail
-                                        )}"
-                                        placeholder="https://..."
-                                    >
-
-                                </div>
-
-                                <div class="field full">
-
-                                    <label>
-                                        Large Image URL
-                                    </label>
-
-                                    <input
-                                        name="image"
-                                        value="${escapeHTML(
-                                            config.panel.image
-                                        )}"
-                                        placeholder="https://..."
-                                    >
-
-                                </div>
-
-                            </div>
-
-                        </div>
-
-                        <!-- PERMISSIONS -->
-
-                        <div class="section">
-
-                            <h2>
-                                Ticket Permissions
-                            </h2>
-
-                            <div class="section-desc">
-                                Configure who gets access to tickets.
-                            </div>
-
-                            <div class="form-grid">
-
-                                <div class="field">
-
-                                    <label>
-                                        Ticket Category
-                                    </label>
-
-                                    <select
-                                        name="categoryId"
-                                    >
-
-                                        <option value="">
-                                            No Category
-                                        </option>
-
-                                        ${categories
-                                            .map(
-                                                category => `
-                                                <option
-                                                    value="${category.id}"
-                                                    ${
-                                                        config.ticket.categoryId ===
-                                                        category.id
-                                                            ? "selected"
-                                                            : ""
-                                                    }
-                                                >
-                                                    ${escapeHTML(
-                                                        category.name
-                                                    )}
-                                                </option>
-                                                `
-                                            )
-                                            .join("")}
-
-                                    </select>
-
-                                </div>
-
-                                <div class="field">
-
-                                    <label>
-                                        Support Role
-                                    </label>
-
-                                    <select
-                                        name="supportRoleId"
-                                    >
-
-                                        <option value="">
-                                            No Support Role
-                                        </option>
-
-                                        ${roles
-                                            .map(
-                                                role => `
-                                                <option
-                                                    value="${role.id}"
-                                                    ${
-                                                        config.ticket.supportRoleId ===
-                                                        role.id
-                                                            ? "selected"
-                                                            : ""
-                                                    }
-                                                >
-                                                    @${escapeHTML(
-                                                        role.name
-                                                    )}
-                                                </option>
-                                                `
-                                            )
-                                            .join("")}
-
-                                    </select>
-
-                                </div>
-
-                                <div class="field">
-
-                                    <label>
-                                        Close Permission Role
-                                    </label>
-
-                                    <select
-                                        name="closeRoleId"
-                                    >
-
-                                        <option value="">
-                                            Support Role / Admin
-                                        </option>
-
-                                        ${roles
-                                            .map(
-                                                role => `
-                                                <option
-                                                    value="${role.id}"
-                                                    ${
-                                                        config.ticket.closeRoleId ===
-                                                        role.id
-                                                            ? "selected"
-                                                            : ""
-                                                    }
-                                                >
-                                                    @${escapeHTML(
-                                                        role.name
-                                                    )}
-                                                </option>
-                                                `
-                                            )
-                                            .join("")}
-
-                                    </select>
-
-                                </div>
-
-                                <div class="field">
-
-                                    <label>
-                                        Ticket Name Prefix
-                                    </label>
-
-                                    <input
-                                        name="prefix"
-                                        maxlength="30"
-                                        value="${escapeHTML(
-                                            config.ticket.prefix
-                                        )}"
-                                    >
-
-                                </div>
-
-                                <div class="field full">
-
-                                    <label class="checkbox">
-
-                                        <input
-                                            type="checkbox"
-                                            name="allowUserClose"
-                                            ${
-                                                config.ticket.allowUserClose
-                                                    ? "checked"
-                                                    : ""
-                                            }
-                                        >
-
-                                        Allow the ticket creator
-                                        to close their ticket
-
-                                    </label>
-
-                                </div>
-
-                            </div>
-
-                        </div>
-
-                        <!-- SEND -->
-
-                        <div class="section">
-
-                            <h2>
-                                Send Ticket Panel
-                            </h2>
-
-                            <div class="section-desc">
-                                This is the only place ticket panels
-                                are sent.
-                            </div>
-
-                            <div class="form-grid">
-
-                                <div class="field">
-
-                                    <label>
-                                        Discord Channel
-                                    </label>
-
-                                    <select
-                                        name="channelId"
-                                        required
-                                    >
-
-                                        <option value="">
-                                            Select a channel
-                                        </option>
-
-                                        ${channels
-                                            .map(
-                                                channel => `
-                                                <option
-                                                    value="${channel.id}"
-                                                >
-                                                    #${escapeHTML(
-                                                        channel.name
-                                                    )}
-                                                </option>
-                                                `
-                                            )
-                                            .join("")}
-
-                                    </select>
-
-                                </div>
-
-                            </div>
-
-                            <div class="actions">
-
-                                <button
-                                    class="btn"
-                                    type="submit"
-                                >
-                                    Save & Send Panel
-                                </button>
-
-                                <a
-                                    class="btn secondary"
-                                    href="/dashboard"
-                                >
-                                    Back to Servers
-                                </a>
-
-                            </div>
-
-                        </div>
-
-                    </form>
-
-                    <!-- PREVIEW -->
-
-                    <div class="section">
-
-                        <h2>
-                            Panel Preview
-                        </h2>
-
-                        <div class="section-desc">
-                            Live preview of the embed.
-                        </div>
-
-                        <div class="preview">
-
-                            <div
-                                id="previewEmbed"
-                                class="preview-embed"
-                                style="border-left-color:${escapeHTML(
-                                    config.panel.color
-                                )}"
-                            >
-
-                                <div
-                                    id="previewTitle"
-                                    class="preview-title"
-                                >
-                                    ${escapeHTML(
-                                        config.panel.title
-                                    )}
-                                </div>
-
-                                <div
-                                    id="previewDescription"
-                                    class="preview-description"
-                                >
-                                    ${escapeHTML(
-                                        config.panel.description
-                                    )}
-                                </div>
-
-                            </div>
-
-                        </div>
-
-                    </div>
-
-                </div>
-
-                <script>
-
-                const title =
-                    document.querySelector(
-                        '[name="title"]'
-                    );
-
-                const description =
-                    document.querySelector(
-                        '[name="description"]'
-                    );
-
-                const color =
-                    document.querySelector(
-                        '[name="color"]'
-                    );
-
-                const previewTitle =
-                    document.getElementById(
-                        "previewTitle"
-                    );
-
-                const previewDescription =
-                    document.getElementById(
-                        "previewDescription"
-                    );
-
-                const previewEmbed =
-                    document.getElementById(
-                        "previewEmbed"
-                    );
-
-                function updatePreview() {
-
-                    previewTitle.textContent =
-                        title.value ||
-                        "Need help?";
-
-                    previewDescription.textContent =
-                        description.value ||
-                        "Click the button below to create a private support ticket.";
-
-                    if (
-                        /^#[0-9a-fA-F]{6}$/.test(
-                            color.value
-                        )
-                    ) {
-
-                        previewEmbed.style.borderLeftColor =
-                            color.value;
-
+app.get("/dashboard", (req, res) => {
+    if (!req.session.user) {
+        return res.redirect("/login");
+    }
+
+    const guilds = Array.isArray(req.session.guilds)
+        ? req.session.guilds
+        : [];
+
+    const manageableGuilds = guilds.filter(guild => {
+        const permissions =
+            BigInt(guild.permissions || "0");
+
+        const administrator =
+            (permissions &
+                PermissionsBitField.Flags.Administrator) !==
+            0n;
+
+        const manageGuild =
+            (permissions &
+                PermissionsBitField.Flags.ManageGuild) !==
+            0n;
+
+        return administrator || manageGuild;
+    });
+
+    const selectedGuildId =
+        req.query.guild ||
+        (manageableGuilds[0]
+            ? manageableGuilds[0].id
+            : "");
+
+    if (!selectedGuildId) {
+        return res.send(`
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>${escapeHtml(BOT_NAME)}</title>
+                <style>
+                    body {
+                        margin: 0;
+                        background: #080808;
+                        color: white;
+                        font-family: Arial;
+                        display: flex;
+                        justify-content: center;
+                        align-items: center;
+                        min-height: 100vh;
                     }
 
-                }
+                    .box {
+                        width: 500px;
+                        max-width: 90%;
+                        background: #111;
+                        border: 1px solid #292929;
+                        border-radius: 18px;
+                        padding: 35px;
+                        text-align: center;
+                    }
 
-                title.addEventListener(
-                    "input",
-                    updatePreview
-                );
+                    a {
+                        color: #8d95ff;
+                    }
+                </style>
+            </head>
 
-                description.addEventListener(
-                    "input",
-                    updatePreview
-                );
+            <body>
+                <div class="box">
+                    <h1>No Manageable Servers</h1>
+                    <p>
+                        You need Administrator or Manage Server
+                        permissions on a Discord server.
+                    </p>
 
-                color.addEventListener(
-                    "input",
-                    updatePreview
-                );
-
-                </script>
-                `,
-                req.session.user
-            )
-        );
+                    <a href="/logout">Logout</a>
+                </div>
+            </body>
+            </html>
+        `);
     }
-);
+
+    const selectedGuild =
+        manageableGuilds.find(
+            guild => guild.id === selectedGuildId
+        );
+
+    if (!selectedGuild) {
+        return res.status(403).send("You do not have access to this server.");
+    }
+
+    const config =
+        getGuildConfig(selectedGuild.id);
+
+    const botGuild =
+        client.guilds.cache.get(selectedGuild.id);
+
+    let channels = [];
+
+    let roles = [];
+
+    if (botGuild) {
+        channels = [
+            ...botGuild.channels.cache.values()
+        ]
+            .filter(channel =>
+                channel.type === ChannelType.GuildText ||
+                channel.type === ChannelType.GuildAnnouncement
+            )
+            .sort((a, b) =>
+                a.position - b.position
+            );
+
+        roles = [
+            ...botGuild.roles.cache.values()
+        ]
+            .filter(role => role.id !== botGuild.id)
+            .sort((a, b) =>
+                b.position - a.position
+            );
+    }
+
+    const guildOptions = manageableGuilds
+        .map(guild => `
+            <option
+                value="${escapeHtml(guild.id)}"
+                ${guild.id === selectedGuildId ? "selected" : ""}
+            >
+                ${escapeHtml(guild.name)}
+            </option>
+        `)
+        .join("");
+
+    const channelOptions = channels
+        .map(channel => `
+            <option
+                value="${escapeHtml(channel.id)}"
+                ${channel.id === config.dashboard.panelChannelId ? "selected" : ""}
+            >
+                #${escapeHtml(channel.name)}
+            </option>
+        `)
+        .join("");
+
+    const categoryOptions = botGuild
+        ? [
+            ...botGuild.channels.cache.values()
+        ]
+            .filter(channel =>
+                channel.type === ChannelType.GuildCategory
+            )
+            .map(channel => `
+                <option
+                    value="${escapeHtml(channel.id)}"
+                    ${channel.id === config.ticket.categoryId ? "selected" : ""}
+                >
+                    ${escapeHtml(channel.name)}
+                </option>
+            `)
+            .join("")
+        : "";
+
+    const roleOptions = roles
+        .map(role => `
+            <option
+                value="${escapeHtml(role.id)}"
+                ${role.id === config.ticket.supportRoleId ? "selected" : ""}
+            >
+                ${escapeHtml(role.name)}
+            </option>
+        `)
+        .join("");
+
+    const closeRoleOptions = roles
+        .map(role => `
+            <option
+                value="${escapeHtml(role.id)}"
+                ${role.id === config.ticket.closeRoleId ? "selected" : ""}
+            >
+                ${escapeHtml(role.name)}
+            </option>
+        `)
+        .join("");
+
+    res.send(`
+<!DOCTYPE html>
+<html>
+<head>
+
+<title>${escapeHtml(BOT_NAME)} Dashboard</title>
+
+<meta name="viewport"
+      content="width=device-width, initial-scale=1">
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: #080808;
+    color: #fff;
+    font-family:
+        Inter,
+        Arial,
+        Helvetica,
+        sans-serif;
+}
+
+.top {
+    height: 70px;
+    border-bottom: 1px solid #202020;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 30px;
+    background: #0b0b0b;
+}
+
+.brand {
+    font-size: 20px;
+    font-weight: 800;
+}
+
+.top-right {
+    display: flex;
+    gap: 15px;
+    align-items: center;
+}
+
+.user {
+    color: #aaa;
+    font-size: 14px;
+}
+
+.logout {
+    color: #aaa;
+    text-decoration: none;
+}
+
+.container {
+    width: min(1150px, 94%);
+    margin: 35px auto;
+}
+
+.server-box {
+    background: #101010;
+    border: 1px solid #242424;
+    border-radius: 15px;
+    padding: 18px;
+    margin-bottom: 25px;
+}
+
+select,
+input,
+textarea {
+    width: 100%;
+    background: #0b0b0b;
+    color: white;
+    border: 1px solid #303030;
+    border-radius: 9px;
+    padding: 12px;
+    outline: none;
+}
+
+select:focus,
+input:focus,
+textarea:focus {
+    border-color: #5865f2;
+}
+
+textarea {
+    min-height: 130px;
+    resize: vertical;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns:
+        repeat(auto-fit, minmax(320px, 1fr));
+    gap: 20px;
+}
+
+.card {
+    background: #101010;
+    border: 1px solid #242424;
+    border-radius: 15px;
+    padding: 22px;
+}
+
+.card h2 {
+    margin-top: 0;
+    font-size: 18px;
+}
+
+label {
+    display: block;
+    color: #aaa;
+    font-size: 13px;
+    margin: 15px 0 7px;
+}
+
+.button {
+    margin-top: 18px;
+    background: #5865f2;
+    border: 0;
+    border-radius: 9px;
+    padding: 12px 17px;
+    color: white;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.button:hover {
+    background: #4752c4;
+}
+
+.success {
+    background: #12361f;
+    border: 1px solid #245d36;
+    color: #8ee0a7;
+    padding: 13px;
+    border-radius: 10px;
+    margin-bottom: 20px;
+}
+
+.warning {
+    background: #302a12;
+    border: 1px solid #5a4d20;
+    color: #e8d58c;
+    padding: 13px;
+    border-radius: 10px;
+    margin-bottom: 20px;
+}
+
+.small {
+    color: #777;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<header class="top">
+
+    <div class="brand">
+        ${escapeHtml(BOT_NAME)}
+    </div>
+
+    <div class="top-right">
+
+        <div class="user">
+            ${escapeHtml(
+                req.session.user.username
+            )}
+        </div>
+
+        <a
+            class="logout"
+            href="/logout"
+        >
+            Logout
+        </a>
+
+    </div>
+
+</header>
+
+<main class="container">
+
+    <h1>Dashboard</h1>
+
+    <p class="small">
+        Configure ${escapeHtml(BOT_NAME)}
+        for your Discord server.
+    </p>
+
+    <div class="server-box">
+
+        <label>
+            Server
+        </label>
+
+        <select
+            onchange="window.location='/dashboard?guild=' + this.value"
+        >
+            ${guildOptions}
+        </select>
+
+    </div>
+
+    ${
+        !botGuild
+            ? `
+                <div class="warning">
+                    Aperture Tickets is not in this server.
+                    Invite the bot first before configuring
+                    ticket channels and roles.
+                </div>
+            `
+            : ""
+    }
+
+    <form
+        method="POST"
+        action="/dashboard/save"
+    >
+
+        <input
+            type="hidden"
+            name="guildId"
+            value="${escapeHtml(selectedGuildId)}"
+        >
+
+        <div class="grid">
+
+            <section class="card">
+
+                <h2>Ticket Panel</h2>
+
+                <label>Panel Title</label>
+
+                <input
+                    name="title"
+                    value="${escapeHtml(config.panel.title)}"
+                >
+
+                <label>Description</label>
+
+                <textarea
+                    name="description"
+                >${escapeHtml(config.panel.description)}</textarea>
+
+                <label>Color</label>
+
+                <input
+                    name="color"
+                    value="${escapeHtml(config.panel.color)}"
+                    placeholder="#5865F2"
+                >
+
+                <label>Footer</label>
+
+                <input
+                    name="footer"
+                    value="${escapeHtml(config.panel.footer)}"
+                >
+
+                <label>Button Label</label>
+
+                <input
+                    name="buttonLabel"
+                    value="${escapeHtml(config.panel.buttonLabel)}"
+                >
+
+                <label>Button Style</label>
+
+                <select name="buttonStyle">
+
+                    <option
+                        value="primary"
+                        ${config.panel.buttonStyle === "primary" ? "selected" : ""}
+                    >
+                        Blue
+                    </option>
+
+                    <option
+                        value="success"
+                        ${config.panel.buttonStyle === "success" ? "selected" : ""}
+                    >
+                        Green
+                    </option>
+
+                    <option
+                        value="secondary"
+                        ${config.panel.buttonStyle === "secondary" ? "selected" : ""}
+                    >
+                        Gray
+                    </option>
+
+                    <option
+                        value="danger"
+                        ${config.panel.buttonStyle === "danger" ? "selected" : ""}
+                    >
+                        Red
+                    </option>
+
+                </select>
+
+                <label>Thumbnail URL</label>
+
+                <input
+                    name="thumbnail"
+                    value="${escapeHtml(config.panel.thumbnail)}"
+                    placeholder="https://..."
+                >
+
+                <label>Image URL</label>
+
+                <input
+                    name="image"
+                    value="${escapeHtml(config.panel.image)}"
+                    placeholder="https://..."
+                >
+
+            </section>
+
+            <section class="card">
+
+                <h2>Ticket Settings</h2>
+
+                <label>Ticket Category</label>
+
+                <select name="categoryId">
+
+                    <option value="">
+                        No category
+                    </option>
+
+                    ${categoryOptions}
+
+                </select>
+
+                <label>Support Role</label>
+
+                <select name="supportRoleId">
+
+                    <option value="">
+                        No support role
+                    </option>
+
+                    ${roleOptions}
+
+                </select>
+
+                <label>Close Permission Role</label>
+
+                <select name="closeRoleId">
+
+                    <option value="">
+                        Anyone with permission
+                    </option>
+
+                    ${closeRoleOptions}
+
+                </select>
+
+                <label>Ticket Prefix</label>
+
+                <input
+                    name="prefix"
+                    value="${escapeHtml(config.ticket.prefix)}"
+                >
+
+                <label>
+                    Allow ticket creator to close tickets
+                </label>
+
+                <select name="allowUserClose">
+
+                    <option
+                        value="true"
+                        ${config.ticket.allowUserClose ? "selected" : ""}
+                    >
+                        Yes
+                    </option>
+
+                    <option
+                        value="false"
+                        ${!config.ticket.allowUserClose ? "selected" : ""}
+                    >
+                        No
+                    </option>
+
+                </select>
+
+            </section>
+
+            <section class="card">
+
+                <h2>Dashboard Panel Channel</h2>
+
+                <label>
+                    Send the ticket panel to
+                </label>
+
+                <select name="panelChannelId">
+
+                    <option value="">
+                        Select a channel
+                    </option>
+
+                    ${channelOptions}
+
+                </select>
+
+                <p class="small">
+                    Ticket panels can only be sent from
+                    the Aperture Tickets dashboard.
+                </p>
+
+                <button
+                    class="button"
+                    type="submit"
+                >
+                    Save & Send Panel
+                </button>
+
+            </section>
+
+        </div>
+
+    </form>
+
+</main>
+
+</body>
+</html>
+    `);
+});
 
 /* =========================================================
-   SAVE CONFIG + SEND PANEL
+   SAVE DASHBOARD
 ========================================================= */
 
-app.post(
-    "/dashboard/:guildId/save",
-    requireLogin,
-    async (req, res) => {
+app.post("/dashboard/save", async (req, res) => {
+    if (!req.session.user) {
+        return res.redirect("/login");
+    }
 
-        try {
+    const {
+        guildId,
+        title,
+        description,
+        color,
+        footer,
+        buttonLabel,
+        buttonStyle,
+        thumbnail,
+        image,
+        categoryId,
+        supportRoleId,
+        closeRoleId,
+        allowUserClose,
+        prefix,
+        panelChannelId
+    } = req.body;
 
-            const guildId =
-                req.params.guildId;
+    if (!guildId) {
+        return res.status(400).send("Missing guild ID.");
+    }
 
-            const userGuild =
-                (req.session.guilds || [])
-                    .find(
-                        guild =>
-                            guild.id === guildId
-                    );
+    const guild = client.guilds.cache.get(guildId);
+
+    if (!guild) {
+        return res.status(400).send(
+            "Aperture Tickets is not in this server."
+        );
+    }
+
+    const config = getGuildConfig(guildId);
+
+    config.panel.title =
+        title || "Contact Support";
+
+    config.panel.description =
+        description ||
+        "Click the button below to create a private support ticket.";
+
+    config.panel.color =
+        color || "#5865F2";
+
+    config.panel.footer =
+        footer || BOT_NAME;
+
+    config.panel.buttonLabel =
+        buttonLabel || "Create Ticket";
+
+    config.panel.buttonStyle =
+        buttonStyle || "primary";
+
+    config.panel.thumbnail =
+        thumbnail || "";
+
+    config.panel.image =
+        image || "";
+
+    config.ticket.categoryId =
+        categoryId || "";
+
+    config.ticket.supportRoleId =
+        supportRoleId || "";
+
+    config.ticket.closeRoleId =
+        closeRoleId || "";
+
+    config.ticket.allowUserClose =
+        allowUserClose !== "false";
+
+    config.ticket.prefix =
+        prefix || "ticket";
+
+    config.dashboard.panelChannelId =
+        panelChannelId || "";
+
+    saveGuildData();
+
+    if (!panelChannelId) {
+        return res.redirect(
+            `/dashboard?guild=${encodeURIComponent(guildId)}`
+        );
+    }
+
+    const channel =
+        guild.channels.cache.get(panelChannelId);
+
+    if (!channel) {
+        return res.status(400).send(
+            "The selected channel could not be found."
+        );
+    }
+
+    try {
+        const embed = new EmbedBuilder()
+            .setTitle(config.panel.title)
+            .setDescription(config.panel.description)
+            .setColor(
+                config.panel.color || "#5865F2"
+            );
+
+        if (config.panel.footer) {
+            embed.setFooter({
+                text: config.panel.footer
+            });
+        }
+
+        if (config.panel.thumbnail) {
+            embed.setThumbnail(
+                config.panel.thumbnail
+            );
+        }
+
+        if (config.panel.image) {
+            embed.setImage(
+                config.panel.image
+            );
+        }
+
+        const styles = {
+            primary: ButtonStyle.Primary,
+            secondary: ButtonStyle.Secondary,
+            success: ButtonStyle.Success,
+            danger: ButtonStyle.Danger
+        };
+
+        const button =
+            new ButtonBuilder()
+                .setCustomId("aperture_create_ticket")
+                .setLabel(
+                    config.panel.buttonLabel ||
+                    "Create Ticket"
+                )
+                .setStyle(
+                    styles[
+                        config.panel.buttonStyle
+                    ] || ButtonStyle.Primary
+                );
+
+        const row =
+            new ActionRowBuilder()
+                .addComponents(button);
+
+        await channel.send({
+            embeds: [embed],
+            components: [row]
+        });
+
+        res.send(`
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Panel Sent</title>
+                <meta
+                    http-equiv="refresh"
+                    content="2;url=/dashboard?guild=${encodeURIComponent(guildId)}"
+                >
+
+                <style>
+                    body {
+                        margin: 0;
+                        background: #080808;
+                        color: white;
+                        font-family: Arial;
+                        display: flex;
+                        justify-content: center;
+                        align-items: center;
+                        min-height: 100vh;
+                    }
+
+                    .box {
+                        background: #111;
+                        border: 1px solid #292929;
+                        border-radius: 18px;
+                        padding: 35px;
+                        text-align: center;
+                    }
+                </style>
+            </head>
+
+            <body>
+                <div class="box">
+                    <h1>Panel Sent</h1>
+                    <p>
+                        Your Aperture Tickets panel was
+                        sent successfully.
+                    </p>
+                </div>
+            </body>
+            </html>
+        `);
+
+    } catch (error) {
+        console.error(
+            "Could not send ticket panel:",
+            error
+        );
+
+        res.status(500).send(`
+            <h1>Could not send panel</h1>
+            <p>
+                Make sure Aperture Tickets has permission
+                to view and send messages in that channel.
+            </p>
+        `);
+    }
+});
+
+/* =========================================================
+   DISCORD INTERACTIONS
+========================================================= */
+
+client.on("interactionCreate", async interaction => {
+    try {
+        if (interaction.isChatInputCommand()) {
 
             if (
-                !userGuild ||
-                !isManager(userGuild)
+                interaction.commandName === "ticket"
             ) {
-                return res.status(403).send(
-                    "Access denied."
-                );
-            }
 
+                const subcommand =
+                    interaction.options.getSubcommand();
+
+                if (subcommand === "status") {
+
+                    const config =
+                        getGuildConfig(
+                            interaction.guildId
+                        );
+
+                    const embed =
+                        new EmbedBuilder()
+                            .setTitle(
+                                "Aperture Tickets Status"
+                            )
+                            .setColor("#5865F2")
+                            .addFields(
+                                {
+                                    name: "Panel Channel",
+                                    value:
+                                        config.dashboard.panelChannelId
+                                            ? `<#${config.dashboard.panelChannelId}>`
+                                            : "Not configured",
+                                    inline: true
+                                },
+                                {
+                                    name: "Category",
+                                    value:
+                                        config.ticket.categoryId
+                                            ? `<#${config.ticket.categoryId}>`
+                                            : "Not configured",
+                                    inline: true
+                                },
+                                {
+                                    name: "Support Role",
+                                    value:
+                                        config.ticket.supportRoleId
+                                            ? `<@&${config.ticket.supportRoleId}>`
+                                            : "Not configured",
+                                    inline: true
+                                }
+                            )
+                            .setFooter({
+                                text: BOT_NAME
+                            });
+
+                    return interaction.reply({
+                        embeds: [embed],
+                        ephemeral: true
+                    });
+                }
+
+                if (subcommand === "config") {
+
+                    const url =
+                        `${DASHBOARD_URL}/dashboard?guild=${interaction.guildId}`;
+
+                    return interaction.reply({
+                        content:
+                            `Configure **${BOT_NAME}** here:\n${url}`,
+                        ephemeral: true
+                    });
+                }
+
+                if (subcommand === "close") {
+
+                    if (
+                        !interaction.channel ||
+                        !interaction.channel.name.startsWith(
+                            "ticket-"
+                        )
+                    ) {
+                        return interaction.reply({
+                            content:
+                                "This command can only be used inside a ticket.",
+                            ephemeral: true
+                        });
+                    }
+
+                    await interaction.reply(
+                        "Closing this ticket..."
+                    );
+
+                    setTimeout(async () => {
+                        try {
+                            await interaction.channel.delete(
+                                "Ticket closed"
+                            );
+                        } catch {}
+                    }, 1500);
+
+                    return;
+                }
+            }
+        }
+
+        if (
+            interaction.isButton() &&
+            interaction.customId ===
+                "aperture_create_ticket"
+        ) {
             const guild =
-                client.guilds.cache.get(
-                    guildId
-                );
-
-            if (!guild) {
-                return res.status(400).send(
-                    "Bot is not installed."
-                );
-            }
+                interaction.guild;
 
             const config =
-                getGuildConfig(guildId);
+                getGuildConfig(guild.id);
 
-            /* PANEL */
-
-            config.panel.title =
-                String(
-                    req.body.title ||
-                        "Need help?"
-                ).slice(0, 256);
-
-            config.panel.description =
-                String(
-                    req.body.description ||
-                        "Click the button below to create a private support ticket."
-                ).slice(0, 4000);
-
-            config.panel.color =
-                String(
-                    req.body.color ||
-                        "#5865F2"
+            const existing =
+                guild.channels.cache.find(
+                    channel =>
+                        channel.name ===
+                        `${config.ticket.prefix}-${interaction.user.id}`
                 );
 
-            config.panel.footer =
-                String(
-                    req.body.footer || ""
-                ).slice(0, 2048);
-
-            config.panel.buttonLabel =
-                String(
-                    req.body.buttonLabel ||
-                        "Create Ticket"
-                ).slice(0, 80);
-
-            config.panel.buttonStyle =
-                [
-                    "Primary",
-                    "Secondary",
-                    "Success",
-                    "Danger"
-                ].includes(
-                    req.body.buttonStyle
-                )
-                    ? req.body.buttonStyle
-                    : "Primary";
-
-            config.panel.thumbnail =
-                String(
-                    req.body.thumbnail || ""
-                ).slice(0, 1000);
-
-            config.panel.image =
-                String(
-                    req.body.image || ""
-                ).slice(0, 1000);
-
-            /* TICKET */
-
-            config.ticket.categoryId =
-                String(
-                    req.body.categoryId || ""
-                );
-
-            config.ticket.supportRoleId =
-                String(
-                    req.body.supportRoleId || ""
-                );
-
-            config.ticket.closeRoleId =
-                String(
-                    req.body.closeRoleId || ""
-                );
-
-            config.ticket.prefix =
-                String(
-                    req.body.prefix || "ticket"
-                )
-                    .replace(
-                        /[^a-zA-Z0-9-_]/g,
-                        ""
-                    )
-                    .slice(0, 30) ||
-                "ticket";
-
-            config.ticket.allowUserClose =
-                req.body.allowUserClose === "on";
-
-            /* CHANNEL */
-
-            const channel =
-                guild.channels.cache.get(
-                    req.body.channelId
-                );
-
-            if (
-                !channel ||
-                ![
-                    ChannelType.GuildText,
-                    ChannelType.GuildAnnouncement
-                ].includes(channel.type)
-            ) {
-
-                return res.status(400).send(
-                    "Invalid Discord channel."
-                );
+            if (existing) {
+                return interaction.reply({
+                    content:
+                        `You already have a ticket: ${existing}`,
+                    ephemeral: true
+                });
             }
 
-            saveDatabase();
+            const permissionOverwrites = [
+                {
+                    id: guild.roles.everyone.id,
+                    deny: [
+                        PermissionsBitField.Flags.ViewChannel
+                    ]
+                },
+                {
+                    id: interaction.user.id,
+                    allow: [
+                        PermissionsBitField.Flags.ViewChannel,
+                        PermissionsBitField.Flags.SendMessages,
+                        PermissionsBitField.Flags.ReadMessageHistory
+                    ]
+                }
+            ];
 
-            /* EMBED */
+            if (config.ticket.supportRoleId) {
+                permissionOverwrites.push({
+                    id: config.ticket.supportRoleId,
+                    allow: [
+                        PermissionsBitField.Flags.ViewChannel,
+                        PermissionsBitField.Flags.SendMessages,
+                        PermissionsBitField.Flags.ReadMessageHistory
+                    ]
+                });
+            }
 
-            const embed =
-                new EmbedBuilder()
-                    .setTitle(
-                        config.panel.title
-                    )
-                    .setDescription(
-                        config.panel.description
-                    )
-                    .setColor(
-                        colorToInt(
-                            config.panel.color
-                        )
-                    );
-
-            if (
-                config.panel.footer
-            ) {
-
-                embed.setFooter({
-                    text:
-                        config.panel.footer
+            const ticketChannel =
+                await guild.channels.create({
+                    name:
+                        `${config.ticket.prefix}-${interaction.user.id}`,
+                    type: ChannelType.GuildText,
+                    parent:
+                        config.ticket.categoryId || undefined,
+                    permissionOverwrites
                 });
 
-            }
-
-            if (
-                config.panel.thumbnail
-            ) {
-
-                try {
-                    embed.setThumbnail(
-                        config.panel.thumbnail
-                    );
-                } catch {}
-
-            }
-
-            if (
-                config.panel.image
-            ) {
-
-                try {
-                    embed.setImage(
-                        config.panel.image
-                    );
-                } catch {}
-
-            }
-
-            /* BUTTON */
-
-            let buttonStyle =
-                ButtonStyle.Primary;
-
-            if (
-                config.panel.buttonStyle ===
-                "Secondary"
-            ) {
-                buttonStyle =
-                    ButtonStyle.Secondary;
-            }
-
-            if (
-                config.panel.buttonStyle ===
-                "Success"
-            ) {
-                buttonStyle =
-                    ButtonStyle.Success;
-            }
-
-            if (
-                config.panel.buttonStyle ===
-                "Danger"
-            ) {
-                buttonStyle =
-                    ButtonStyle.Danger;
-            }
-
-            const button =
+            const closeButton =
                 new ButtonBuilder()
                     .setCustomId(
-                        "nexustickets:create"
+                        "aperture_close_ticket"
                     )
-                    .setLabel(
-                        config.panel.buttonLabel
-                    )
+                    .setLabel("Close Ticket")
                     .setStyle(
-                        buttonStyle
+                        ButtonStyle.Danger
                     );
 
             const row =
                 new ActionRowBuilder()
-                    .addComponents(
-                        button
-                    );
-
-            /* SEND */
-
-            const message =
-                await channel.send({
-                    embeds: [embed],
-                    components: [row]
-                });
-
-            config.lastPanel = {
-                channelId:
-                    channel.id,
-                messageId:
-                    message.id
-            };
-
-            saveDatabase();
-
-            res.send(
-                layout(
-                    "Panel Sent",
-                    `
-                    <div class="container page">
-
-                        <div class="section">
-
-                            <h2>
-                                Ticket panel sent
-                            </h2>
-
-                            <p class="section-desc">
-                                The panel was sent successfully
-                                to #${escapeHTML(
-                                    channel.name
-                                )}.
-                            </p>
-
-                            <div class="actions">
-
-                                <a
-                                    class="btn"
-                                    href="/dashboard/${guildId}"
-                                >
-                                    Back to Dashboard
-                                </a>
-
-                            </div>
-
-                        </div>
-
-                    </div>
-                    `,
-                    req.session.user
-                )
-            );
-
-        } catch (error) {
-
-            console.error(
-                "SEND PANEL ERROR:",
-                error
-            );
-
-            res.status(500).send(
-                layout(
-                    "Panel Error",
-                    `
-                    <div class="container page">
-
-                        <div class="section">
-
-                            <h2>
-                                Panel could not be sent
-                            </h2>
-
-                            <p class="section-desc">
-                                ${escapeHTML(
-                                    error.message
-                                )}
-                            </p>
-
-                            <a
-                                class="btn"
-                                href="/dashboard"
-                            >
-                                Back
-                            </a>
-
-                        </div>
-
-                    </div>
-                    `,
-                    req.session.user
-                )
-            );
-        }
-    }
-);
-
-/* =========================================================
-   TICKET BUTTONS
-========================================================= */
-
-client.on(
-    "interactionCreate",
-    async interaction => {
-
-        if (!interaction.isButton()) {
-            return;
-        }
-
-        /* =================================================
-           CREATE TICKET
-        ================================================= */
-
-        if (
-            interaction.customId ===
-            "nexustickets:create"
-        ) {
-
-            try {
-
-                const guild =
-                    interaction.guild;
-
-                if (!guild) {
-                    return interaction.reply({
-                        content:
-                            "This button can only be used in a server.",
-                        ephemeral: true
-                    });
-                }
-
-                const config =
-                    getGuildConfig(
-                        guild.id
-                    );
-
-                const existing =
-                    guild.channels.cache.find(
-                        channel =>
-                            channel.type ===
-                                ChannelType.GuildText &&
-                            channel.topic ===
-                                `nexustickets-owner:${interaction.user.id}`
-                    );
-
-                if (existing) {
-
-                    return interaction.reply({
-                        content:
-                            `You already have an open ticket: ${existing}`,
-                        ephemeral: true
-                    });
-
-                }
-
-                let category = null;
-
-                if (
-                    config.ticket.categoryId
-                ) {
-
-                    const possible =
-                        guild.channels.cache.get(
-                            config.ticket.categoryId
-                        );
-
-                    if (
-                        possible &&
-                        possible.type ===
-                            ChannelType.GuildCategory
-                    ) {
-                        category =
-                            possible;
-                    }
-
-                }
-
-                const overwrites = [
-
-                    {
-                        id:
-                            guild.roles
-                                .everyone.id,
-
-                        deny: [
-                            PermissionFlagsBits.ViewChannel
-                        ]
-                    },
-
-                    {
-                        id:
-                            interaction.user.id,
-
-                        allow: [
-                            PermissionFlagsBits.ViewChannel,
-                            PermissionFlagsBits.SendMessages,
-                            PermissionFlagsBits.ReadMessageHistory,
-                            PermissionFlagsBits.AttachFiles,
-                            PermissionFlagsBits.EmbedLinks
-                        ]
-                    }
-
-                ];
-
-                if (
-                    config.ticket.supportRoleId
-                ) {
-
-                    const role =
-                        guild.roles.cache.get(
-                            config.ticket.supportRoleId
-                        );
-
-                    if (role) {
-
-                        overwrites.push({
-                            id: role.id,
-
-                            allow: [
-                                PermissionFlagsBits.ViewChannel,
-                                PermissionFlagsBits.SendMessages,
-                                PermissionFlagsBits.ReadMessageHistory,
-                                PermissionFlagsBits.AttachFiles,
-                                PermissionFlagsBits.EmbedLinks
-                            ]
-                        });
-
-                    }
-
-                }
-
-                overwrites.push({
-                    id: client.user.id,
-
-                    allow: [
-                        PermissionFlagsBits.ViewChannel,
-                        PermissionFlagsBits.SendMessages,
-                        PermissionFlagsBits.ReadMessageHistory,
-                        PermissionFlagsBits.ManageChannels
-                    ]
-                });
-
-                const username =
-                    interaction.user.username
-                        .toLowerCase()
-                        .replace(
-                            /[^a-z0-9-]/g,
-                            ""
-                        )
-                        .slice(0, 40) ||
-                    "user";
-
-                const channel =
-                    await guild.channels.create({
-                        name:
-                            `${config.ticket.prefix}-${username}`,
-
-                        type:
-                            ChannelType.GuildText,
-
-                        parent:
-                            category
-                                ? category.id
-                                : undefined,
-
-                        topic:
-                            `nexustickets-owner:${interaction.user.id}`,
-
-                        permissionOverwrites:
-                            overwrites
-                    });
-
-                const welcome =
-                    new EmbedBuilder()
-                        .setTitle(
-                            "Ticket Created"
-                        )
-                        .setDescription(
-                            `Welcome ${interaction.user}.\n\n` +
-                            "Please explain your issue and our support team will assist you."
-                        )
-                        .setColor(
-                            colorToInt(
-                                config.panel.color
-                            )
-                        )
-                        .setFooter({
-                            text:
-                                BOT_NAME
-                        });
-
-                const closeButton =
-                    new ButtonBuilder()
-                        .setCustomId(
-                            "nexustickets:close"
-                        )
-                        .setLabel(
-                            "Close Ticket"
-                        )
-                        .setStyle(
-                            ButtonStyle.Danger
-                        );
-
-                const row =
-                    new ActionRowBuilder()
-                        .addComponents(
-                            closeButton
-                        );
-
-                await channel.send({
-                    content:
-                        `${interaction.user}`,
-
-                    embeds: [
-                        welcome
-                    ],
-
-                    components: [
-                        row
-                    ]
-                });
-
-                await interaction.reply({
-                    content:
-                        `Your ticket has been created: ${channel}`,
-
-                    ephemeral: true
-                });
-
-            } catch (error) {
-
-                console.error(
-                    "CREATE TICKET ERROR:",
-                    error
-                );
-
-                if (
-                    !interaction.replied
-                ) {
-
-                    await interaction.reply({
-                        content:
-                            "I couldn't create the ticket. Make sure the bot has Manage Channels permission.",
-
-                        ephemeral: true
-                    });
-
-                }
-
-            }
-
-            return;
-        }
-
-        /* =================================================
-           CLOSE TICKET
-        ================================================= */
-
-        if (
-            interaction.customId ===
-            "nexustickets:close"
-        ) {
-
-            try {
-
-                const channel =
-                    interaction.channel;
-
-                if (
-                    !channel ||
-                    !interaction.guild
-                ) {
-                    return;
-                }
-
-                if (
-                    !channel.topic ||
-                    !channel.topic.startsWith(
-                        "nexustickets-owner:"
-                    )
-                ) {
-
-                    return interaction.reply({
-                        content:
-                            "This is not a NexusTickets channel.",
-
-                        ephemeral: true
-                    });
-
-                }
-
-                const ownerId =
-                    channel.topic.replace(
-                        "nexustickets-owner:",
-                        ""
-                    );
-
-                const config =
-                    getGuildConfig(
-                        interaction.guild.id
-                    );
-
-                const isOwner =
-                    interaction.user.id ===
-                    ownerId;
-
-                const isAdmin =
-                    interaction.member.permissions.has(
-                        PermissionFlagsBits.Administrator
-                    ) ||
-                    interaction.member.permissions.has(
-                        PermissionFlagsBits.ManageGuild
-                    );
-
-                let hasCloseRole = false;
-
-                if (
-                    config.ticket.closeRoleId
-                ) {
-
-                    hasCloseRole =
-                        interaction.member.roles.cache.has(
-                            config.ticket.closeRoleId
-                        );
-
-                } else if (
-                    config.ticket.supportRoleId
-                ) {
-
-                    hasCloseRole =
-                        interaction.member.roles.cache.has(
-                            config.ticket.supportRoleId
-                        );
-
-                }
-
-                if (
-                    !isAdmin &&
-                    !hasCloseRole &&
-                    !(
-                        isOwner &&
-                        config.ticket.allowUserClose
-                    )
-                ) {
-
-                    return interaction.reply({
-                        content:
-                            "You do not have permission to close this ticket.",
-
-                        ephemeral: true
-                    });
-
-                }
-
-                await interaction.reply(
-                    "Closing this ticket..."
-                );
-
-                setTimeout(
-                    async () => {
-
-                        try {
-
-                            await channel.delete(
-                                "NexusTickets ticket closed"
-                            );
-
-                        } catch {}
-
-                    },
-                    1000
-                );
-
-            } catch (error) {
-
-                console.error(
-                    "CLOSE TICKET ERROR:",
-                    error
-                );
-
-            }
-
-            return;
-        }
-
-    }
-);
-
-/* =========================================================
-   SLASH COMMANDS
-========================================================= */
-
-const commands = [
-
-    new SlashCommandBuilder()
-        .setName("ticket")
-        .setDescription(
-            "NexusTickets management commands"
-        )
-        .addSubcommand(
-            sub =>
-                sub
-                    .setName("status")
-                    .setDescription(
-                        "View the ticket system status"
-                    )
-        )
-        .addSubcommand(
-            sub =>
-                sub
-                    .setName("config")
-                    .setDescription(
-                        "View the current ticket configuration"
-                    )
-        )
-        .addSubcommand(
-            sub =>
-                sub
-                    .setName("close")
-                    .setDescription(
-                        "Close the current ticket"
-                    )
-        )
-
-].map(
-    command => command.toJSON()
-);
-
-/* =========================================================
-   SLASH COMMAND HANDLER
-========================================================= */
-
-client.on(
-    "interactionCreate",
-    async interaction => {
-
-        if (
-            !interaction.isChatInputCommand()
-        ) {
-            return;
-        }
-
-        if (
-            interaction.commandName !==
-            "ticket"
-        ) {
-            return;
-        }
-
-        const subcommand =
-            interaction.options.getSubcommand();
-
-        /* STATUS */
-
-        if (
-            subcommand === "status"
-        ) {
-
-            const guild =
-                interaction.guild;
-
-            if (!guild) {
-
-                return interaction.reply({
-                    content:
-                        "This command must be used in a server.",
-                    ephemeral: true
-                });
-
-            }
-
-            const config =
-                getGuildConfig(
-                    guild.id
-                );
+                    .addComponents(closeButton);
 
             const embed =
                 new EmbedBuilder()
                     .setTitle(
-                        `${BOT_NAME} Status`
+                        "Aperture Tickets"
                     )
                     .setDescription(
-                        "Ticket system status for this server."
+                        `Welcome <@${interaction.user.id}>.\n\n` +
+                        `A member of the support team will be with you shortly.\n\n` +
+                        `Use the button below when you are finished.`
                     )
-                    .addFields(
-                        {
-                            name:
-                                "Panel Channel",
-                            value:
-                                config.lastPanel.channelId
-                                    ? `<#${config.lastPanel.channelId}>`
-                                    : "Not configured",
-                            inline: true
-                        },
-                        {
-                            name:
-                                "Category",
-                            value:
-                                config.ticket.categoryId
-                                    ? `<#${config.ticket.categoryId}>`
-                                    : "Not configured",
-                            inline: true
-                        },
-                        {
-                            name:
-                                "Support Role",
-                            value:
-                                config.ticket.supportRoleId
-                                    ? `<@&${config.ticket.supportRoleId}>`
-                                    : "Not configured",
-                            inline: true
-                        }
-                    )
-                    .setColor(
-                        colorToInt(
-                            config.panel.color
-                        )
-                    );
+                    .setColor("#5865F2")
+                    .setFooter({
+                        text: BOT_NAME
+                    });
 
-            return interaction.reply({
-                embeds: [
-                    embed
-                ],
-                ephemeral: true
+            await ticketChannel.send({
+                content:
+                    config.ticket.supportRoleId
+                        ? `<@&${config.ticket.supportRoleId}>`
+                        : "",
+                embeds: [embed],
+                components: [row]
             });
 
+            return interaction.reply({
+                content:
+                    `Your ticket has been created: ${ticketChannel}`,
+                ephemeral: true
+            });
         }
 
-        /* CONFIG */
-
         if (
-            subcommand === "config"
+            interaction.isButton() &&
+            interaction.customId ===
+                "aperture_close_ticket"
         ) {
-
             const guild =
                 interaction.guild;
 
-            if (!guild) {
-
-                return interaction.reply({
-                    content:
-                        "This command must be used in a server.",
-                    ephemeral: true
-                });
-
-            }
+            const config =
+                getGuildConfig(guild.id);
 
             const member =
                 interaction.member;
 
-            if (
-                !member.permissions.has(
-                    PermissionFlagsBits.ManageGuild
-                ) &&
-                !member.permissions.has(
-                    PermissionFlagsBits.Administrator
-                )
-            ) {
+            const isCreator =
+                interaction.channel.name ===
+                `${config.ticket.prefix}-${interaction.user.id}`;
 
-                return interaction.reply({
-                    content:
-                        "You need Manage Server or Administrator permission.",
-                    ephemeral: true
-                });
-
-            }
-
-            const config =
-                getGuildConfig(
-                    guild.id
-                );
-
-            const embed =
-                new EmbedBuilder()
-                    .setTitle(
-                        "Ticket Configuration"
-                    )
-                    .addFields(
-                        {
-                            name:
-                                "Panel Title",
-                            value:
-                                config.panel.title ||
-                                "None"
-                        },
-                        {
-                            name:
-                                "Panel Channel",
-                            value:
-                                config.lastPanel.channelId
-                                    ? `<#${config.lastPanel.channelId}>`
-                                    : "Not sent"
-                        },
-                        {
-                            name:
-                                "Support Role",
-                            value:
-                                config.ticket.supportRoleId
-                                    ? `<@&${config.ticket.supportRoleId}>`
-                                    : "None"
-                        },
-                        {
-                            name:
-                                "Ticket Category",
-                            value:
-                                config.ticket.categoryId
-                                    ? `<#${config.ticket.categoryId}>`
-                                    : "None"
-                        },
-                        {
-                            name:
-                                "Prefix",
-                            value:
-                                config.ticket.prefix
-                        }
-                    )
-                    .setColor(
-                        colorToInt(
-                            config.panel.color
-                        )
-                    );
-
-            return interaction.reply({
-                embeds: [
-                    embed
-                ],
-                ephemeral: true
-            });
-
-        }
-
-        /* CLOSE */
-
-        if (
-            subcommand === "close"
-        ) {
-
-            const channel =
-                interaction.channel;
-
-            if (
-                !channel ||
-                !channel.topic ||
-                !channel.topic.startsWith(
-                    "nexustickets-owner:"
-                )
-            ) {
-
-                return interaction.reply({
-                    content:
-                        "This is not a NexusTickets ticket.",
-                    ephemeral: true
-                });
-
-            }
-
-            const ownerId =
-                channel.topic.replace(
-                    "nexustickets-owner:",
-                    ""
-                );
-
-            const config =
-                getGuildConfig(
-                    interaction.guild.id
-                );
-
-            const isOwner =
-                interaction.user.id ===
-                ownerId;
-
-            const isAdmin =
-                interaction.member.permissions.has(
-                    PermissionFlagsBits.Administrator
-                ) ||
-                interaction.member.permissions.has(
-                    PermissionFlagsBits.ManageGuild
-                );
-
-            const hasRole =
+            const hasCloseRole =
                 config.ticket.closeRoleId &&
-                interaction.member.roles.cache.has(
+                member.roles.cache.has(
                     config.ticket.closeRoleId
                 );
 
-            const supportRole =
-                config.ticket.supportRoleId &&
-                interaction.member.roles.cache.has(
-                    config.ticket.supportRoleId
+            const administrator =
+                member.permissions.has(
+                    PermissionsBitField.Flags.Administrator
                 );
 
             if (
-                !isAdmin &&
-                !hasRole &&
-                !supportRole &&
-                !(
-                    isOwner &&
-                    config.ticket.allowUserClose
-                )
+                !config.ticket.allowUserClose &&
+                !hasCloseRole &&
+                !administrator
             ) {
-
                 return interaction.reply({
                     content:
                         "You do not have permission to close this ticket.",
                     ephemeral: true
                 });
+            }
 
+            if (
+                config.ticket.allowUserClose &&
+                !isCreator &&
+                !hasCloseRole &&
+                !administrator
+            ) {
+                return interaction.reply({
+                    content:
+                        "You do not have permission to close this ticket.",
+                    ephemeral: true
+                });
             }
 
             await interaction.reply(
                 "Closing this ticket..."
             );
 
-            setTimeout(
-                async () => {
-
-                    try {
-
-                        await channel.delete(
-                            "NexusTickets ticket closed"
-                        );
-
-                    } catch {}
-
-                },
-                1000
-            );
-
+            setTimeout(async () => {
+                try {
+                    await interaction.channel.delete(
+                        "Ticket closed"
+                    );
+                } catch {}
+            }, 1500);
         }
 
-    }
-);
-
-/* =========================================================
-   REGISTER SLASH COMMANDS
-========================================================= */
-
-async function registerCommands() {
-
-    try {
-
-        const rest =
-            new REST({
-                version: "10"
-            }).setToken(
-                TOKEN
-            );
-
-        console.log(
-            "Registering NexusTickets slash commands..."
-        );
-
-        await rest.put(
-            Routes.applicationCommands(
-                CLIENT_ID
-            ),
-            {
-                body: commands
-            }
-        );
-
-        console.log(
-            "Slash commands registered:"
-        );
-
-        console.log(
-            "  /ticket status"
-        );
-
-        console.log(
-            "  /ticket config"
-        );
-
-        console.log(
-            "  /ticket close"
-        );
-
-        console.log(
-            "Panel sending remains dashboard-only."
-        );
-
     } catch (error) {
-
         console.error(
-            "Slash command registration failed:"
-        );
-
-        console.error(
+            "Interaction error:",
             error
         );
 
+        if (
+            interaction.isRepliable() &&
+            !interaction.replied &&
+            !interaction.deferred
+        ) {
+            await interaction.reply({
+                content:
+                    "An unexpected error occurred.",
+                ephemeral: true
+            });
+        }
     }
-
-}
+});
 
 /* =========================================================
-   BOT READY
+   DISCORD READY
 ========================================================= */
 
-client.once(
-    "ready",
-    async () => {
+client.once("ready", async () => {
+    console.log("");
+    console.log("======================================");
+    console.log(`${BOT_NAME} is online`);
+    console.log(`Logged in as ${client.user.tag}`);
+    console.log("======================================");
+    console.log("");
 
-        console.log("");
+    await registerCommands();
+});
+
+/* =========================================================
+   ERROR HANDLING
+========================================================= */
+
+client.on("error", error => {
+    console.error(
+        "Discord client error:",
+        error
+    );
+});
+
+process.on("unhandledRejection", error => {
+    console.error(
+        "Unhandled rejection:",
+        error
+    );
+});
+
+process.on("uncaughtException", error => {
+    console.error(
+        "Uncaught exception:",
+        error
+    );
+});
+
+/* =========================================================
+   START
+========================================================= */
+
+app.listen(
+    PORT,
+    "0.0.0.0",
+    () => {
         console.log(
-            "======================================"
+            `${BOT_NAME} dashboard running on port ${PORT}`
         );
 
         console.log(
-            `${BOT_NAME} is online`
-        );
-
-        console.log(
-            `Logged in as: ${client.user.tag}`
-        );
-
-        console.log(
-            `Servers: ${client.guilds.cache.size}`
-        );
-
-        console.log(
-            `Dashboard: ${DASHBOARD_URL}`
+            `Dashboard URL: ${DASHBOARD_URL}`
         );
 
         console.log(
             `OAuth Redirect: ${REDIRECT_URI}`
         );
-
-        console.log(
-            "======================================"
-        );
-
-        console.log("");
-
-        await registerCommands();
-
     }
 );
 
-/* =========================================================
-   WEB SERVER
-========================================================= */
-
-app.listen(
-    PORT,
-    () => {
-
-        console.log(
-            `Dashboard running at ${DASHBOARD_URL}`
-        );
-
-    }
-);
-
-/* =========================================================
-   LOGIN
-========================================================= */
-
-client.login(
-    TOKEN
-).catch(
-    error => {
-
-        console.error(
-            "Discord bot login failed:"
-        );
-
-        console.error(
-            error
-        );
-
-    }
-);
+client.login(DISCORD_TOKEN);
